@@ -1,0 +1,10 @@
+[server]
+enableXsrfProtection = true
+enableCORS = true
+port = 8501
+
+[theme]
+primaryColor = "#2563eb"
+backgroundColor = "#f8fafc"
+secondaryBackgroundColor = "#eef2ff"
+textColor = "#0f172a"
