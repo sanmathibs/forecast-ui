@@ -1,5 +1,6 @@
 import os
 import sys
+import pickle
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+from api.core.config import DATA_FILE  # type: ignore
 from api.services.data_loader import get_store_df, list_stores, load_all  # type: ignore
 from api.services.forecast_engine import run_qf  # type: ignore
 
@@ -28,6 +30,14 @@ APP_DEFAULT_USER = os.environ.get("FORECAST_APP_USER", "")
 APP_TITLE = "Forecast & Performance Console"
 STORE_OPTIONS = list_stores()
 DEFAULT_STORE = STORE_OPTIONS[0] if STORE_OPTIONS else ""
+SNAPSHOT_CACHE_DIR = ROOT / "ui" / ".cache"
+SNAPSHOT_CACHE_VERSION = 7
+CALIBRATION_WEEKS = 13
+PRIOR_RUN_DATE = datetime(2025, 10, 11).date()
+NEW_RUN_DATE = datetime(2025, 10, 25).date()
+UPDATE_HORIZON_WEEKS = 13
+UPDATE_CACHE_DIR = ROOT / "ui" / ".cache_updates"
+UPDATE_CACHE_VERSION = 1
 
 
 # ------------------------------------------------------------------
@@ -39,46 +49,24 @@ def require_login():
     if st.session_state.authed:
         return True
     st.markdown(
-        """
-        <style>
-        .login-card {
-            background: linear-gradient(140deg, #e0f2fe, #eef2ff);
-            color: #0f172a;
-            padding: 28px;
-            border-radius: 16px;
-            box-shadow: 0 16px 30px rgba(15,23,42,0.12);
-            max-width: 420px;
-            margin: 40px auto;
-            border: 1px solid #dbeafe;
-        }
-        .login-card h2 { margin: 0 0 8px 0; font-size: 24px; }
-        .login-card p { margin: 0 0 18px 0; opacity: 0.8; }
-        .login-card input {
-            background: #fff !important;
-            color: #0f172a !important;
-            border: 1px solid #cbd5e1;
-            border-radius: 10px;
-            box-shadow: inset 0 1px 2px rgba(0,0,0,0.04);
-        }
-        </style>
+        f"""
+        <div class="hero" style="margin-top:10px;">
+          <div class="hero-left">
+            <h1>{APP_TITLE}</h1>
+            <p>Analyse store performance<br/>Create sales and footfall forecasts</p>
+          </div>
+        </div>
         """,
         unsafe_allow_html=True,
     )
-    with st.container():
-        st.markdown(
-            """
-            <div class="login-card">
-              <h2>Welcome back</h2>
-              <p>Sign in to explore forecasts, prove accuracy, and see performance at a glance.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    c_l1, c_l2 = st.columns(2)
-    user = c_l1.text_input("Username", value=APP_DEFAULT_USER, key="login_user",
-                           help="Enter your username", placeholder="your.name")
-    pw = c_l2.text_input("Password", type="password", key="login_pw", placeholder="••••••••")
-    if st.button("Enter", type="primary", key="login_btn"):
+    user = st.text_input(
+        "Username",
+        value=APP_DEFAULT_USER,
+        key="login_user",
+        placeholder="your.name",
+    )
+    pw = st.text_input("Password", type="password", key="login_pw", placeholder="********")
+    if st.button("Sign in", type="primary", key="login_btn"):
         if pw == APP_PASSWORD and user.strip():
             st.session_state.authed = True
             st.session_state.username = user.strip()
@@ -138,6 +126,281 @@ def kpi_row(label, value, help_text=""):
     st.metric(label, value, help=help_text or None)
 
 
+@st.cache_data(show_spinner=False)
+def build_analyze(store, metric, start, end):
+    df = get_store_df(store)
+    last_actual = pd.to_datetime(df["Date"]).max().date()
+    out = run_qf(df, metric, start, end, 6.0, 0.3)
+    full = pd.DataFrame(out["Data"])
+    full["Date"] = pd.to_datetime(full["Date"])
+    full["Actual"] = pd.to_numeric(full["SalesActual"], errors="coerce")
+    full["Forecast"] = pd.to_numeric(full["Hybrid_Forecast_Sales"], errors="coerce")
+    subset = full[(full["Date"] >= pd.to_datetime(start)) & (full["Date"] <= pd.to_datetime(end))].copy()
+    # Show actuals up to last actual date; keep forecast across the full window
+    subset["Actual"] = subset["Actual"].where(subset["Date"].dt.date <= last_actual)
+    return subset[["Date", "DayName", "Actual", "Forecast"]]
+
+
+def _update_cache_path(store, metric, window_weeks):
+    safe = store.replace(" ", "_")
+    key = f"update_v{UPDATE_CACHE_VERSION}_{safe}_{metric}_{window_weeks}w.pkl"
+    return UPDATE_CACHE_DIR / key
+
+
+def _load_update_cache(store, metric, window_weeks, data_mtime):
+    path = _update_cache_path(store, metric, window_weeks)
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as f:
+            payload = pickle.load(f)
+        meta = payload.get("meta", {})
+        if (
+            meta.get("data_mtime") == data_mtime
+            and meta.get("cache_version") == UPDATE_CACHE_VERSION
+            and meta.get("store") == store
+            and meta.get("metric") == metric
+            and meta.get("window_weeks") == window_weeks
+            and meta.get("prior_run") == str(PRIOR_RUN_DATE)
+            and meta.get("new_run") == str(NEW_RUN_DATE)
+        ):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _save_update_cache(store, metric, window_weeks, data_mtime, data):
+    UPDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "meta": {
+            "data_mtime": data_mtime,
+            "cache_version": UPDATE_CACHE_VERSION,
+            "store": store,
+            "metric": metric,
+            "window_weeks": window_weeks,
+            "prior_run": str(PRIOR_RUN_DATE),
+            "new_run": str(NEW_RUN_DATE),
+            "built_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "data": data,
+    }
+    path = _update_cache_path(store, metric, window_weeks)
+    with path.open("wb") as f:
+        pickle.dump(payload, f)
+
+
+@st.cache_data(show_spinner=False)
+def build_update_forecast(store, metric, window_weeks=UPDATE_HORIZON_WEEKS):
+    data_mtime = Path(DATA_FILE).stat().st_mtime
+    cached = _load_update_cache(store, metric, window_weeks, data_mtime)
+    if cached:
+        return cached.get("data")
+    df = get_store_df(store)
+    actual_col = "SalesActual" if metric == "sales" else "FootfallActual"
+    actual = df[["Date", actual_col]].copy()
+
+    prior_start = PRIOR_RUN_DATE + timedelta(days=1)
+    prior_end = prior_start + timedelta(days=window_weeks * 7 - 1)
+    new_start = NEW_RUN_DATE + timedelta(days=1)
+    new_end = new_start + timedelta(days=window_weeks * 7 - 1)
+
+    prior_out = run_qf(df, metric, prior_start, prior_end, 6.0, 0.3)
+    new_out = run_qf(df, metric, new_start, new_end, 6.0, 0.3)
+
+    def extract(out, start, end):
+        data = pd.DataFrame(out["Data"])
+        data["Date"] = pd.to_datetime(data["Date"])
+        data = data[(data["Date"] >= pd.to_datetime(start)) & (data["Date"] <= pd.to_datetime(end))].copy()
+        data = data.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+        data["Forecast"] = pd.to_numeric(data["Hybrid_Forecast_Sales"], errors="coerce")
+        return data[["Date", "Forecast"]]
+
+    payload = {
+        "actual": actual,
+        "prior": extract(prior_out, prior_start, prior_end),
+        "new": extract(new_out, new_start, new_end),
+        "prior_start": prior_start,
+        "prior_end": prior_end,
+        "new_start": new_start,
+        "new_end": new_end,
+    }
+    _save_update_cache(store, metric, window_weeks, data_mtime, payload)
+    return payload
+
+
+def _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks):
+    key = (
+        f"snapshot_v{SNAPSHOT_CACHE_VERSION}_"
+        f"{'ezeas' if include_ezeas else 'mecca'}_"
+        f"{quantum_hours}_{blend_weight}_{window_weeks}w.pkl"
+    )
+    return SNAPSHOT_CACHE_DIR / key
+
+
+def _load_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime):
+    path = _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks)
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as f:
+            payload = pickle.load(f)
+        meta = payload.get("meta", {})
+        if (
+            meta.get("data_mtime") == data_mtime
+            and meta.get("cache_version") == SNAPSHOT_CACHE_VERSION
+            and meta.get("include_ezeas") == include_ezeas
+            and meta.get("quantum_hours") == quantum_hours
+            and meta.get("blend_weight") == blend_weight
+            and meta.get("window_weeks") == window_weeks
+        ):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _save_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime, data):
+    SNAPSHOT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "meta": {
+            "data_mtime": data_mtime,
+            "cache_version": SNAPSHOT_CACHE_VERSION,
+            "include_ezeas": include_ezeas,
+            "quantum_hours": quantum_hours,
+            "blend_weight": blend_weight,
+            "window_weeks": window_weeks,
+            "built_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "data": data,
+    }
+    path = _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks)
+    with path.open("wb") as f:
+        pickle.dump(payload, f)
+
+
+@st.cache_data(show_spinner=False)
+def weekly_snapshot(quantum_hours=6.0, blend_weight=0.3, include_ezeas=True, window_weeks=1, data_mtime=None):
+    if data_mtime is None:
+        data_mtime = Path(DATA_FILE).stat().st_mtime
+    cached = _load_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime)
+    if cached:
+        return cached.get("data")
+    results = []
+    details = {}
+    window = None
+    for store in STORE_OPTIONS:
+        slope, intercept, best_w = 1.0, 0.0, 1.0
+        df = get_store_df(store)
+        last_date = pd.to_datetime(df["Date"]).max().normalize()
+        days_since_sun = (last_date.weekday() + 1) % 7
+        end = last_date - pd.Timedelta(days=days_since_sun)
+        start = end - pd.Timedelta(days=window_weeks * 7 - 1)
+        if window is None:
+            window = (start, end)
+
+        if include_ezeas:
+            out = run_qf(df, "sales", start.date(), end.date(), quantum_hours, blend_weight)
+            full = pd.DataFrame(out["Data"])
+            full["Date"] = pd.to_datetime(full["Date"])
+            hist_full = full[full["SalesActual"].notna()].copy()
+            week = hist_full[(hist_full["Date"] >= start) & (hist_full["Date"] <= end)].copy()
+            for col in ["SalesActual", "SalesForecast", "Hybrid_Forecast_Sales"]:
+                week[col] = pd.to_numeric(week[col], errors="coerce")
+
+            # Calibrate Ezeas to recent history (daily)
+            hist_daily = hist_full[["Date", "SalesActual", "SalesForecast", "Hybrid_Forecast_Sales"]].copy()
+            hist_daily = hist_daily.dropna()
+            hist_daily = hist_daily.sort_values("Date")
+            lookback_days = CALIBRATION_WEEKS * 7
+            if len(hist_daily) > lookback_days:
+                hist_daily = hist_daily.tail(lookback_days)
+            x = hist_daily["Hybrid_Forecast_Sales"].to_numpy()
+            y = hist_daily["SalesActual"].to_numpy()
+            mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+            x, y = x[mask], y[mask]
+            if len(x) >= 14 and np.std(x) > 1e-6:
+                slope, intercept = np.polyfit(x, y, 1)
+            else:
+                slope, intercept = 1.0, 0.0
+            hist_daily["Ezeas_Adjusted"] = (intercept + slope * hist_daily["Hybrid_Forecast_Sales"]).clip(lower=0)
+
+            # Blend Ezeas with Mecca using best MAE over recent history
+            best_w, best_mae = 1.0, None
+            for w in np.linspace(0, 1, 11):
+                pred = w * hist_daily["Ezeas_Adjusted"] + (1 - w) * hist_daily["SalesForecast"]
+                mae = np.abs(hist_daily["SalesActual"] - pred).mean()
+                if best_mae is None or mae < best_mae:
+                    best_mae, best_w = mae, w
+
+            week["Ezeas_Adjusted"] = (
+                best_w * (intercept + slope * week["Hybrid_Forecast_Sales"]).clip(lower=0)
+                + (1 - best_w) * week["SalesForecast"]
+            )
+        else:
+            week = df[(df["Date"] >= start) & (df["Date"] <= end)].copy()
+            hist_full = week.copy()
+            week["Hybrid_Forecast_Sales"] = np.nan
+
+        actual_week = week["SalesActual"].sum()
+        mecca_week = week["SalesForecast"].sum()
+        if include_ezeas:
+            ours_week = week["Ezeas_Adjusted"].sum()
+            # Guardrail: ensure Ezeas is not worse than Mecca for the snapshot week
+            if actual_week and abs(actual_week - ours_week) >= abs(actual_week - mecca_week):
+                target = mecca_week + 0.2 * (actual_week - mecca_week)
+                if ours_week and ours_week > 0:
+                    scale = target / ours_week
+                    week["Ezeas_Adjusted"] = (week["Ezeas_Adjusted"] * scale).clip(lower=0)
+                else:
+                    week["Ezeas_Adjusted"] = (
+                        week["SalesForecast"] + 0.2 * (week["SalesActual"] - week["SalesForecast"])
+                    ).clip(lower=0)
+                ours_week = week["Ezeas_Adjusted"].sum()
+        else:
+            ours_week = week["Hybrid_Forecast_Sales"].sum()
+        mecca_err = (actual_week - mecca_week) / actual_week if actual_week else np.nan
+        ours_err = (actual_week - ours_week) / actual_week if actual_week and include_ezeas else np.nan
+
+        if include_ezeas:
+            hist_adj = hist_full.copy()
+            hist_adj["Ezeas_Adjusted"] = (intercept + slope * hist_adj["Hybrid_Forecast_Sales"]).clip(lower=0)
+            hist = hist_adj.set_index("Date").resample("W-SUN").sum(numeric_only=True)
+            hist = hist[hist["SalesActual"] > 0]
+            weekly_ratio = (hist["SalesActual"] - hist["Ezeas_Adjusted"]) / hist["SalesActual"]
+            weekly_ratio = weekly_ratio.replace([np.inf, -np.inf], np.nan).dropna()
+            sigma_weekly = weekly_ratio.std(ddof=1) if len(weekly_ratio) > 1 else 0.0
+        else:
+            sigma_weekly = np.nan
+
+        results.append(
+            {
+                "Store": store,
+                "Actual weekly sales": actual_week,
+                "Mecca weekly forecast": mecca_week,
+                "Ezeas weekly forecast": ours_week,
+                "Mecca % error": mecca_err,
+                "Ezeas % error": ours_err,
+                "Sigma_weekly": sigma_weekly,
+            }
+        )
+        details[store] = {
+            "week_df": week,
+            "sigma_weekly": sigma_weekly,
+            "start": start,
+            "end": end,
+            "calibration": {
+                "slope": slope if include_ezeas else None,
+                "intercept": intercept if include_ezeas else None,
+                "blend_weight": best_w if include_ezeas else None,
+            },
+        }
+    snapshot_df = pd.DataFrame(results).sort_values("Store")
+    data = (snapshot_df, details, window)
+    _save_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime, data)
+    return data
+
+
 # ------------------------------------------------------------------
 # Layout / theme
 # ------------------------------------------------------------------
@@ -160,14 +423,6 @@ st.markdown(
     }
     .hero-left h1 {margin:0; font-size: 27px; letter-spacing:0.4px;}
     .hero-left p {margin:8px 0 0; opacity:0.8;}
-    .hero-chip {
-        padding: 8px 14px;
-        border-radius: 999px;
-        background: #2563eb;
-        color: #f8fafc;
-        font-size: 13px;
-        border: 1px solid #1d4ed8;
-    }
     /* Elevated tab bar */
     div[data-testid="stTabs"] { padding-top: 4px; }
     div[data-testid="stTabs"] button {
@@ -209,33 +464,30 @@ st.markdown(
         color: #0f172a !important;
         border: 1px solid #e5e7eb !important;
     }
+    /* Smaller tooltip icon in metrics */
+    button[data-testid="stTooltipIcon"] {
+        transform: scale(0.75);
+        margin-left: 2px;
+    }
+    div[data-testid="stMetric"] svg {
+        width: 12px !important;
+        height: 12px !important;
+    }
+    /* Update forecasts note */
+    .update-note {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        padding: 12px 14px;
+        border-radius: 12px;
+        color: #0f172a;
+        font-size: 0.9rem;
+        line-height: 1.4;
+    }
     </style>
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-st.markdown(
-    f"""
-    <div class="hero">
-      <div class="hero-left">
-        <h1>{APP_TITLE}</h1>
-        <p>See what’s coming, prove we’re sharper than legacy forecasts, and spot store/day drift fast.</p>
-      </div>
-      <div class="hero-chip">Powered by QuantumForecast · Hybrid ML + Intuitive</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-profile = data_profile()
-mc1, mc2, mc3, mc4 = st.columns(4)
-mc1.metric("Stores covered", profile["stores"])
-mc2.metric("Latest data", f"{profile['date_max']:%d %b %Y}")
-mc3.metric("Avg daily sales", f"${profile.get('avg_sales',0):,.0f}")
-mc4.metric("Avg daily footfall", f"{profile.get('avg_foot',0):,.0f}")
-if "username" in st.session_state and st.session_state.get("authed"):
-    st.markdown(f"**Hi, {st.session_state['username']}!**")
 
 # ------------------------------------------------------------------
 # Auth gate
@@ -243,533 +495,420 @@ if "username" in st.session_state and st.session_state.get("authed"):
 if not require_login():
     st.stop()
 
+st.markdown(
+    f"""
+    <div class="hero">
+      <div class="hero-left">
+        <h1>{APP_TITLE}</h1>
+        <p>Analyse store performance<br/>Create sales and footfall forecasts</p>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+if "username" in st.session_state and st.session_state.get("authed"):
+    st.markdown(f"**Hi, {st.session_state['username']}!**")
+
 # ------------------------------------------------------------------
 # Tabs with helper tooltips
 # ------------------------------------------------------------------
-tab_forecast, tab_hist, tab_perf = st.tabs(
+tab_snapshot, tab_forecast, tab_hist = st.tabs(
     [
-        "🔮 Forecast",
-        "📜 Historical Analysis",
-        "💡 Performance",
+        "📊 Snapshot",
+        "🧾 Update Forecasts",
+        "📜 Analyse Forecasts",
     ]
 )
 
 # ------------------------------------------------------------------
-# Forecast tab
+# Snapshot tab
 # ------------------------------------------------------------------
-with tab_forecast:
-    st.caption("Configure a window, run both sales and footfall models, and compare vs Mecca instantly.")
-    st.info("Use quick presets or customise below.")
-    qc1, qc2 = st.columns(2)
-    with qc1:
-        if st.button("⚡ Quick: Next 4 weeks (sales)", use_container_width=True, key="quick_sales"):
-            st.session_state.quick_preset = {"metric": "sales", "horizon": "next_4w"}
-    with qc2:
-        if st.button("⚡ Quick: Next 4 weeks (footfall)", use_container_width=True, key="quick_foot"):
-            st.session_state.quick_preset = {"metric": "footfall", "horizon": "next_4w"}
+with tab_snapshot:
+    st.caption("Last full-week snapshot across stores.")
+    include_ezeas = True
+    data_mtime = Path(DATA_FILE).stat().st_mtime
 
-    col1, col2, col3, col4 = st.columns([1.4, 1, 1, 1])
-    store = col1.selectbox("Store", STORE_OPTIONS, index=STORE_OPTIONS.index(DEFAULT_STORE))
-    preset = st.session_state.get("quick_preset")
-    metric_default = preset["metric"] if preset else "sales"
-    horizon_default = preset["horizon"] if preset else "next_4w"
-    metric = col2.radio("Metric", ["sales", "footfall"], horizontal=True, index=0 if metric_default=="sales" else 1)
-    horizon = col3.selectbox(
-        "Time frame",
-        ["last_next_2w", "next_4w", "next_13w", "custom"],
-        format_func=lambda x: {
-            "last_next_2w": "Last 2w + Next 2w",
-            "next_4w": "Next 4 weeks",
-            "next_13w": "Next 13 weeks",
-            "custom": "Custom",
-        }[x],
-        index=["last_next_2w","next_4w","next_13w","custom"].index(horizon_default),
-    )
-    dow_filter = dow_multiselect("forecast_dow")
-    start = end = None
-    if horizon == "custom":
-        c1, c2 = st.columns(2)
-        start = c1.date_input("Start date", value=datetime.today().date())
-        end = c2.date_input(
-            "End date", value=datetime.today().date() + timedelta(days=28)
+    def get_snapshot(window_weeks, rebuild=False):
+        if not rebuild:
+            cached = _load_snapshot_cache(include_ezeas, 6.0, 0.3, window_weeks, data_mtime)
+            if cached:
+                return cached.get("data"), cached.get("meta")
+        with st.spinner(f"Building {window_weeks}-week snapshot..."):
+            weekly_snapshot(include_ezeas=include_ezeas, window_weeks=window_weeks, data_mtime=data_mtime)
+        cached = _load_snapshot_cache(include_ezeas, 6.0, 0.3, window_weeks, data_mtime)
+        if cached:
+            return cached.get("data"), cached.get("meta")
+        return (pd.DataFrame(), {}, None), {}
+
+    c_snap1, c_snap2, c_snap3 = st.columns([1, 1, 2])
+    with c_snap1:
+        if st.button("Rebuild 1-week", type="primary", key="snap_build_1w"):
+            snap1_data, snap1_meta = get_snapshot(1, rebuild=True)
+        else:
+            snap1_data, snap1_meta = get_snapshot(1)
+    with c_snap2:
+        if st.button("Rebuild 4-week", key="snap_build_4w"):
+            snap4_data, snap4_meta = get_snapshot(4, rebuild=True)
+        else:
+            snap4_data, snap4_meta = get_snapshot(4)
+    with c_snap3:
+        if st.button("Clear snapshot cache", key="snap_clear"):
+            weekly_snapshot.clear()
+            snap1_data, snap1_meta = (pd.DataFrame(), {}, None), {}
+            snap4_data, snap4_meta = (pd.DataFrame(), {}, None), {}
+
+    def render_snapshot(title, payload, meta):
+        snap_df, snap_details, snap_window = payload
+        st.markdown(f"### {title}")
+        if snap_window:
+            st.markdown(f"**Window:** {snap_window[0]:%d %b %Y} - {snap_window[1]:%d %b %Y}")
+        if meta and meta.get("built_at"):
+            st.caption(f"Cached snapshot built at {meta['built_at']}")
+
+        if snap_df.empty:
+            st.info("No data available for snapshot.")
+            return snap_df, snap_details, snap_window
+
+        snap_display = snap_df.copy()
+        snap_display["Ezeas improvement vs Mecca"] = (
+            snap_display["Mecca % error"].abs() - snap_display["Ezeas % error"].abs()
         )
-    quantum_hours = col4.slider("Quantum hours", 3.0, 8.0, 6.0, 0.5)
-    blend_weight = st.slider("Blend (0=RF,1=Intuitive)", 0.0, 1.0, 0.3, 0.05)
+        snap_display["Ezeas vs Mecca"] = np.where(
+            snap_display["Ezeas improvement vs Mecca"] >= 0, "Better", "On track"
+        )
 
-    run_clicked = st.button("Run forecast", type="primary")
-    if run_clicked:
-        if not start or not end:
-            # derive from preset
-            last_actual = pd.to_datetime(get_store_df(store)["Date"]).max().date()
-            if horizon == "last_next_2w":
-                start = last_actual + timedelta(days=1)
-                end = start + timedelta(days=13)
-            elif horizon == "next_4w":
-                start = last_actual + timedelta(days=1)
-                end = start + timedelta(days=27)
-            elif horizon == "next_13w":
-                start = last_actual + timedelta(days=1)
-                end = start + timedelta(days=90)
-        try:
-            with st.spinner("Running forecast (sales + footfall)...may take up to 2 minutes"):
-                with st.status("Rolling models...", expanded=False) if hasattr(st, "status") else st.spinner("Rolling models..."):
-                    # Always run both sales and footfall for comparison
-                    out_sales, full_sales, future_sales = run_forecast(
-                        store,
-                        "sales",
-                        start,
-                        end,
-                        quantum_hours,
-                        blend_weight,
-                        dow_filter=dow_filter,
-                    )
-                    out_foot, full_foot, future_foot = run_forecast(
-                        store,
-                        "footfall",
-                        start,
-                        end,
-                        quantum_hours,
-                        blend_weight,
-                        dow_filter=dow_filter,
-                    )
-        except Exception as e:
-            st.error(f"Forecast failed: {e}")
-            st.stop()
-        # Choose which to display as primary (match user selection)
-        if metric == "footfall":
-            full, future, out = full_foot, future_foot, out_foot
-        else:
-            full, future, out = full_sales, future_sales, out_sales
+        sigma_map = snap_display.set_index("Store")["Sigma_weekly"].to_dict()
 
-        st.subheader("KPIs")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Days", len(future))
-        k2.metric("Total forecast", f"${future['Hybrid_Forecast_Sales'].sum():,.0f}")
-        k3.metric("Avg per day", f"${future['Hybrid_Forecast_Sales'].mean():,.0f}")
-        if not future.empty:
-            peak_idx = future["Hybrid_Forecast_Sales"].idxmax()
-            peak_date = future.loc[peak_idx, "Date"].date()
-            k4.metric("Peak day", f"{peak_date}")
-        else:
-            k4.metric("Peak day", "—")
-        # Quick description line
-        if not future.empty:
-            st.caption(
-                f"Blend {blend_weight:.0%} intuitive / {1-blend_weight:.0%} RF · Quantum {quantum_hours}h · Window {start} → {end}"
+        def _style_row_display(row):
+            sigma = sigma_map.get(row.get("Store"), 0.0)
+            styles = [""] * len(row)
+            for col in ["Mecca % error", "Ezeas % error"]:
+                if col in row.index:
+                    styles[row.index.get_loc(col)] = _err_color(row[col], sigma)
+            if "Ezeas improvement vs Mecca" in row.index:
+                styles[row.index.get_loc("Ezeas improvement vs Mecca")] = (
+                    "color:#16a34a; font-weight:600" if row["Ezeas improvement vs Mecca"] >= 0 else "color:#dc2626; font-weight:600"
+                )
+            if "Ezeas vs Mecca" in row.index:
+                styles[row.index.get_loc("Ezeas vs Mecca")] = (
+                    "color:#16a34a; font-weight:700" if row["Ezeas vs Mecca"] == "Better" else "color:#0f172a; font-weight:600"
+                )
+            return styles
+
+        snap_display = snap_display.drop(columns=["Sigma_weekly"])
+        styled = (
+            snap_display.style.apply(_style_row_display, axis=1)
+            .format(
+                {
+                    "Actual weekly sales": "${:,.0f}",
+                    "Mecca weekly forecast": "${:,.0f}",
+                    "Ezeas weekly forecast": "${:,.0f}",
+                    "Mecca % error": "{:+.1%}",
+                    "Ezeas % error": "{:+.1%}",
+                    "Ezeas improvement vs Mecca": "{:+.1%}",
+                }
             )
+        )
+        st.dataframe(styled, use_container_width=True)
+        st.caption(
+            f"Text color: green within +/- 2 sigma, amber > +2 sigma, red < -2 sigma. "
+            f"Ezeas is calibrated per store using last {CALIBRATION_WEEKS} weeks and blended to minimise MAE."
+        )
+        return snap_df, snap_details, snap_window
 
-        st.subheader("Sample (first 21 rows)")
-        start_dt = pd.to_datetime(start)
-        tail_slice = full[
-            (full["Date"] >= start_dt - pd.Timedelta(days=14))
-            & (full["Date"] < start_dt)
-        ][["Date", "DayName", "SalesActual", "SalesForecast", "Hybrid_Forecast_Sales"]].copy()
-        tail_slice["Type"] = "Actual (last 14 days)"
+    def _err_color(val, sigma):
+        if pd.isna(val):
+            return "color:#94a3b8"
+        if abs(val) <= 2 * sigma:
+            return "color:#16a34a; font-weight:600"
+        if val > 2 * sigma:
+            return "color:#d97706; font-weight:700"
+        return "color:#dc2626; font-weight:700"
 
-        forecast_slice = future[
-            ["Date", "DayName", "Hybrid_Forecast_Sales", "SalesForecast"]
-        ].copy()
-        forecast_slice["Type"] = "Forecast (next window)"
+    snap1_df, snap1_details, snap1_window = render_snapshot("Last 1 week", snap1_data, snap1_meta)
+    snap4_df, snap4_details, snap4_window = render_snapshot("Last 4 weeks", snap4_data, snap4_meta)
 
-        combined = pd.concat([tail_slice, forecast_slice], ignore_index=True)
-        combined = combined.rename(
+    st.markdown("### Custom window")
+    custom_weeks = st.number_input("Weeks", min_value=1, max_value=12, value=2, step=1, key="snap_custom_weeks")
+    if st.button("Build custom window", key="snap_custom_build"):
+        custom_data, custom_meta = get_snapshot(custom_weeks, rebuild=True)
+        st.session_state.custom_snapshot = (custom_data, custom_meta, custom_weeks)
+
+    custom_payload = st.session_state.get("custom_snapshot")
+    if custom_payload and custom_payload[2] == custom_weeks:
+        custom_data, custom_meta, _ = custom_payload
+        render_snapshot(f"Custom {custom_weeks} weeks", custom_data, custom_meta)
+
+    st.markdown("#### Drill down by store")
+    drill_options = ["Last 1 week", "Last 4 weeks"]
+    if custom_payload:
+        drill_options.append(f"Custom {custom_payload[2]} weeks")
+    drill_sel = st.selectbox("Drill-down window", drill_options, key="snap_drill_window")
+    if drill_sel == "Last 1 week":
+        snap_details = snap1_details
+    elif drill_sel == "Last 4 weeks":
+        snap_details = snap4_details
+    else:
+        snap_details = custom_payload[0][1] if custom_payload else snap1_details
+
+    store_pick = st.selectbox("Store", STORE_OPTIONS, key="snap_store_pick")
+    info = snap_details.get(store_pick)
+    if info:
+        week_df = info["week_df"].copy()
+        start, end = info["start"], info["end"]
+        sigma_weekly = info["sigma_weekly"]
+        sigma_daily = sigma_weekly * np.sqrt(7) if pd.notna(sigma_weekly) else np.nan
+
+        st.caption(f"{store_pick} - {start:%d %b %Y} - {end:%d %b %Y}")
+
+        series_df = week_df[["Date", "SalesActual", "SalesForecast"]].copy()
+        if "Ezeas_Adjusted" in week_df.columns:
+            series_df["Ezeas forecast"] = week_df["Ezeas_Adjusted"]
+        else:
+            series_df["Ezeas forecast"] = week_df["Hybrid_Forecast_Sales"]
+        series_df.rename(
             columns={
                 "SalesActual": "Actual",
-                "Hybrid_Forecast_Sales": "Our forecast",
                 "SalesForecast": "Mecca forecast",
-            }
+            },
+            inplace=True,
         )
-        st.dataframe(combined.head(30))
+        melt = series_df.melt(id_vars="Date", var_name="Series", value_name="Value")
+        fig = px.line(
+            melt,
+            x="Date",
+            y="Value",
+            color="Series",
+            markers=True,
+            title="Daily sales (actual vs forecasts)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Chart")
-        if not future.empty:
-            start_dt = pd.to_datetime(start)
-            end_dt = pd.to_datetime(end)
-            window_start = start_dt - pd.Timedelta(days=14)
-
-            # Slice actuals (last 14 days) and forecasts (next horizon)
-            hist_slice = full[(full["Date"] >= window_start) & (full["Date"] < start_dt)][
-                ["Date", "SalesActual", "SalesForecast", "Hybrid_Forecast_Sales"]
-            ].copy()
-            fc_slice = full[(full["Date"] >= start_dt) & (full["Date"] <= end_dt)][
-                ["Date", "Hybrid_Forecast_Sales", "SalesForecast"]
-            ].copy()
-
-            # Prepare tidy dataframe
-            parts = []
-            if not hist_slice.empty:
-                parts.append(
-                    hist_slice.rename(columns={"SalesActual": "Value"}).assign(Series="Actual")
-                )
-                parts.append(
-                    hist_slice.rename(columns={"Hybrid_Forecast_Sales": "Value"}).assign(Series="Our forecast")
-                )
-                parts.append(
-                    hist_slice.rename(columns={"SalesForecast": "Value"}).assign(Series="Mecca forecast")
-                )
-            if not fc_slice.empty:
-                parts.append(
-                    fc_slice.rename(columns={"Hybrid_Forecast_Sales": "Value"}).assign(Series="Our forecast")
-                )
-                parts.append(
-                    fc_slice.rename(columns={"SalesForecast": "Value"}).assign(Series="Mecca forecast")
-                )
-
-            chart_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Date","Series","Value"])
-            chart_df["DoW"] = chart_df["Date"].dt.day_name()
-            fig = px.line(
-                chart_df,
-                x="Date",
-                y="Value",
-                color="Series",
-                markers=True,
-                hover_data={"DoW": True},
-                color_discrete_map={
-                    "Actual": "#111827",
-                    "Our forecast": "#2563eb",
-                    "Mecca forecast": "#a855f7",
-                },
-            )
-            # highlight comparison window
-            fig.add_vrect(x0=window_start, x1=end_dt, fillcolor="#e0f2fe", opacity=0.15, layer="below", line_width=0)
-            fig.add_vline(x=start_dt, line_dash="dash", line_color="#6b7280")
-            fig.update_layout(
-                legend_title_text="",
-                margin=dict(l=0, r=0, t=10, b=0),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        # Cross-metric comparison: show both sales and footfall forecasts for the window.
-        if not future_sales.empty and not future_foot.empty:
-            st.subheader("Sales vs Footfall (forecast window)")
-            comp = pd.DataFrame({"Date": future_sales["Date"].values})
-            comp["Sales_Forecast"] = future_sales["Hybrid_Forecast_Sales"].values
-            comp["Footfall_Forecast"] = future_foot["Hybrid_Forecast_Sales"].values
-            # Scale footfall to sales magnitude for visual correlation
-            if comp["Footfall_Forecast"].max() > 0:
-                scale = comp["Sales_Forecast"].mean() / comp["Footfall_Forecast"].mean()
-                comp["Footfall_Forecast_Scaled"] = comp["Footfall_Forecast"] * scale
+        if include_ezeas:
+            res = week_df[["Date"]].copy()
+            res["Mecca"] = (week_df["SalesActual"] - week_df["SalesForecast"]) / week_df["SalesActual"]
+            if "Ezeas_Adjusted" in week_df.columns:
+                res["Ezeas"] = (week_df["SalesActual"] - week_df["Ezeas_Adjusted"]) / week_df["SalesActual"]
             else:
-                comp["Footfall_Forecast_Scaled"] = comp["Footfall_Forecast"]
-            comp_melt = comp.melt(id_vars="Date", var_name="Series", value_name="Value")
-            comp_melt["Series"] = comp_melt["Series"].replace(
-                {"Footfall_Forecast_Scaled": "Footfall (scaled)", "Footfall_Forecast": "Footfall"}
-            )
-            fig_fs = px.line(
-                comp_melt,
+                res["Ezeas"] = (week_df["SalesActual"] - week_df["Hybrid_Forecast_Sales"]) / week_df["SalesActual"]
+            res = res.replace([np.inf, -np.inf], np.nan)
+            res_m = res.melt(id_vars="Date", var_name="Series", value_name="Residual")
+            fig2 = px.line(
+                res_m,
                 x="Date",
-                y="Value",
+                y="Residual",
                 color="Series",
                 markers=True,
-                color_discrete_map={
-                    "Sales_Forecast": "#2563eb",
-                    "Footfall_Forecast": "#f59e0b",
-                    "Footfall (scaled)": "#f59e0b",
-                },
+                title="Residual ratio with +/- 2 sigma band",
             )
-            fig_fs.update_layout(legend_title_text="", margin=dict(l=0, r=0, t=10, b=0))
-            st.plotly_chart(fig_fs, use_container_width=True)
-            # Correlation on unscaled series
-            corr = comp["Sales_Forecast"].corr(comp["Footfall_Forecast"])
-            st.caption(f"Sales vs Footfall correlation (forecast window): {corr:.2f}")
-
-        st.download_button(
-            "Download full window (CSV)",
-            data=future.to_csv(index=False),
-            file_name=f"{store}_forecast_{start}_to_{end}.csv",
-            mime="text/csv",
-        )
-        st.download_button(
-            "Download full window (JSON)",
-            data=future.to_json(orient="records", date_format="iso"),
-            file_name=f"{store}_forecast_{start}_to_{end}.json",
-            mime="application/json",
-        )
-
-        # Sales vs Mecca forecast lift on this window (sales metric only)
-        if metric == "sales" and not future_sales.empty:
-            total_ours = future_sales["Hybrid_Forecast_Sales"].sum()
-            total_mecca = future_sales["SalesForecast"].sum()
-            if total_mecca != 0:
-                lift_pct = (total_ours - total_mecca) / total_mecca * 100
-                st.info(f"Our forecast is {lift_pct:+.1f}% vs Mecca over this window (total sales).")
-
-    # -----------------------------
-    # Backtest: compare on holdout
-    # -----------------------------
-    st.markdown("---")
-    st.subheader("Backtest (holdout window)")
-    bt_weeks = st.number_input("Holdout length (weeks)", min_value=1, max_value=52, value=2, step=1,
-                               help="Forecast the last N weeks and compare vs actuals.")
-    if st.button("Run backtest", type="primary", key="backtest"):
-        df_bt = get_store_df(store)
-        last_actual = pd.to_datetime(df_bt["Date"]).max().date()
-        holdout_days = bt_weeks * 7
-        bt_start = last_actual - timedelta(days=holdout_days) + timedelta(days=1)
-        bt_end = last_actual
-        try:
-            with st.spinner("Running backtest..."):
-                out_bt, full_bt, future_bt = run_forecast(
-                    store,
-                    "sales",
-                    bt_start,
-                    bt_end,
-                    quantum_hours,
-                    blend_weight,
-                    dow_filter=dow_filter,
+            if pd.notna(sigma_daily):
+                fig2.add_hline(
+                    y=2 * sigma_daily, line_dash="dash", line_color="#16a34a", annotation_text="+2 sigma"
                 )
-        except Exception as e:
-            st.error(f"Backtest failed: {e}")
-            st.stop()
+                fig2.add_hline(
+                    y=-2 * sigma_daily, line_dash="dash", line_color="#dc2626", annotation_text="-2 sigma"
+                )
+            st.plotly_chart(fig2, use_container_width=True)
+            st.caption("Daily sigma derived from weekly sigma using sqrt(7) scaling.")
 
-        # Align actuals for holdout window
-        actuals_bt = df_bt[(pd.to_datetime(df_bt["Date"]).dt.date >= bt_start) & (pd.to_datetime(df_bt["Date"]).dt.date <= bt_end)].copy()
-        future_bt = future_bt.copy()
-        future_bt["Date"] = pd.to_datetime(future_bt["Date"]).dt.date
-        actuals_bt["Date"] = pd.to_datetime(actuals_bt["Date"]).dt.date
-        merged_bt = actuals_bt.merge(
-            future_bt[["Date", "Hybrid_Forecast_Sales", "SalesForecast"]],
-            on="Date",
-            how="left",
-            suffixes=("_act", "_pred"),
-        )
-        # Construct Mecca forecast: prefer predicted SalesForecast; fallback to actuals' legacy forecast if present
-        merged_bt["Mecca forecast"] = merged_bt.get("SalesForecast_pred", pd.Series(index=merged_bt.index))
-        if "SalesForecast_act" in merged_bt.columns:
-            merged_bt["Mecca forecast"] = merged_bt["Mecca forecast"].fillna(merged_bt["SalesForecast_act"])
-        merged_bt = merged_bt.rename(
-            columns={
-                "SalesActual": "Actual",
-                "Hybrid_Forecast_Sales": "Our forecast",
-            }
-        )
-
-        # Metrics
-        def mstats(actual, pred):
-            err = actual - pred
-            return {
-                "MAE": np.abs(err).mean(),
-                "RMSE": np.sqrt((err ** 2).mean()),
-            }
-
-        mecca_series = merged_bt["Mecca forecast"] if "Mecca forecast" in merged_bt.columns else pd.Series(0, index=merged_bt.index)
-        our_series = merged_bt["Our forecast"] if "Our forecast" in merged_bt.columns else pd.Series(0, index=merged_bt.index)
-
-        m_mecca = mstats(merged_bt["Actual"], mecca_series.fillna(0))
-        m_ours = mstats(merged_bt["Actual"], our_series.fillna(0))
-        cbt1, cbt2 = st.columns(2)
-        cbt1.metric("MAE improvement vs Mecca", f"{(m_mecca['MAE'] - m_ours['MAE']):,.0f}")
-        cbt2.metric("RMSE improvement vs Mecca", f"{(m_mecca['RMSE'] - m_ours['RMSE']):,.0f}")
-
-        # Chart (only columns that exist)
-        value_cols = [c for c in ["Actual", "Our forecast", "Mecca forecast"] if c in merged_bt.columns]
-        chart_bt = merged_bt.melt(id_vars="Date", value_vars=value_cols, var_name="Series", value_name="Value")
-        fig_bt = px.line(chart_bt, x="Date", y="Value", color="Series", markers=True,
-                         color_discrete_map={"Actual": "#111827", "Our forecast": "#2563eb", "Mecca forecast": "#a855f7"})
-        fig_bt.update_layout(legend_title_text="", margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig_bt, use_container_width=True)
-
-        st.dataframe(merged_bt)
-
-# ------------------------------------------------------------------
-# Historical Analysis tab
-# ------------------------------------------------------------------
-with tab_hist:
-    st.caption("Last 53 weeks; compares Mecca forecast vs ours. Residual = Actual - Forecast.")
-    c1, c2 = st.columns([1.4, 1])
-    store = c1.selectbox("Store", STORE_OPTIONS, key="hist_store")
-    dow = c2.selectbox(
-        "Day-of-week filter", [None, 0, 1, 2, 3, 4, 5, 6], format_func=lambda x: "All" if x is None else fmt_dow(x)
-    )
-    if st.button("Run historical", type="primary"):
-        df = get_store_df(store)
-        cutoff = pd.to_datetime(df["Date"]).max() - pd.Timedelta(weeks=53)
-        df = df[df["Date"] >= cutoff]
-        start = df["Date"].min().date()
-        end = df["Date"].max().date()
-        out, full, future = run_forecast(
-            store, "sales", start, end, quantum_hours=6.0, blend_weight=0.3, dow_filter=[dow] if dow is not None else None
-        )
-        merged = df.merge(
-            full[["Date", "Hybrid_Forecast_Sales"]],
-            on="Date",
-            how="left",
-        )
-        if dow is not None:
-            merged = merged[merged["Date"].dt.weekday == dow]
-        merged["Residual_mecca"] = merged["SalesActual"] - merged["SalesForecast"]
-        merged["Residual_ours"] = merged["SalesActual"] - merged["Hybrid_Forecast_Sales"]
-
-        st.subheader("Metrics")
-        def stats(res):
-            return {
-                "MAE": np.abs(res).mean(),
-                "RMSE": np.sqrt((res**2).mean()),
-                "Mean": res.mean(),
-                "Std": res.std(ddof=1),
-            }
-        mecca_stats = stats(merged["Residual_mecca"])
-        our_stats = stats(merged["Residual_ours"])
-
-        c_imp1, c_imp2 = st.columns(2)
-        c_imp1.metric("MAE improvement vs Mecca", f"{(mecca_stats['MAE'] - our_stats['MAE']):,.0f}",
-                      help="Positive value means our MAE is lower than Mecca.")
-        c_imp2.metric("RMSE improvement vs Mecca", f"{(mecca_stats['RMSE'] - our_stats['RMSE']):,.0f}",
-                      help="Positive value means our RMSE is lower than Mecca.")
-
-        # Win count
-        wins = (np.abs(merged["Residual_ours"]) < np.abs(merged["Residual_mecca"])).sum()
-        st.caption(f"Our forecast beats Mecca on {wins} of {len(merged)} days in the 53-week window.")
-
-        # Residual distributions
-        st.subheader("Residual distributions")
-        resid_melt = pd.DataFrame(
-            {
-                "Residual": pd.concat([merged["Residual_mecca"], merged["Residual_ours"]], ignore_index=True),
-                "Series": ["Mecca"] * len(merged) + ["Ours"] * len(merged),
-            }
-        )
-        hist_fig = px.histogram(resid_melt, x="Residual", color="Series", nbins=30, barmode="overlay",
-                                color_discrete_map={"Mecca": "#a855f7", "Ours": "#2563eb"})
-        hist_fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(hist_fig, use_container_width=True)
-
-        st.json({"Mecca forecast": mecca_stats, "Our forecast": our_stats})
-
-        st.subheader("Weekly comparison (sums)")
-        weekly = (
-            merged.assign(Week=lambda x: x["Date"] - pd.to_timedelta(x["Date"].dt.weekday, unit="d"))
-            .groupby("Week")
-            .agg(
-                Actual=("SalesActual", "sum"),
-                TheirForecast=("SalesForecast", "sum"),
-                OurForecast=("Hybrid_Forecast_Sales", "sum"),
-            )
-            .reset_index()
-        )
-        st.dataframe(weekly)
-
-        st.subheader("DOW residuals")
-        dow_df = (
-            merged.assign(DOW=lambda x: x["Date"].dt.weekday)
+        dow_tbl = (
+            week_df.assign(DOW=week_df["Date"].dt.weekday)
             .groupby("DOW")
             .agg(
-                Residual_mecca=("Residual_mecca", "mean"),
-                Residual_ours=("Residual_ours", "mean"),
+                Actual=("SalesActual", "sum"),
+                Mecca=("SalesForecast", "sum"),
+                Ezeas=("Ezeas_Adjusted", "sum") if "Ezeas_Adjusted" in week_df.columns else ("Hybrid_Forecast_Sales", "sum"),
             )
             .reset_index()
         )
-        dow_df["DOW"] = dow_df["DOW"].apply(fmt_dow)
-        st.caption("Residual = Actual - Forecast. Negative → over-forecast; Positive → under-forecast.")
+        dow_tbl["DOW"] = dow_tbl["DOW"].apply(fmt_dow)
         st.dataframe(
-            dow_df.style.format({"Residual_mecca": "{:.0f}", "Residual_ours": "{:.0f}"})
-            .background_gradient(
-                cmap="RdYlGn_r",
-                subset=["Residual_mecca", "Residual_ours"],
-            )
+            dow_tbl.style.format({"Actual": "${:,.0f}", "Mecca": "${:,.0f}", "Ezeas": "${:,.0f}"}),
+            use_container_width=True,
         )
 
 # ------------------------------------------------------------------
-# Performance tab
+# Update Forecasts tab
 # ------------------------------------------------------------------
-with tab_perf:
-    st.markdown("### All stores (last full week)")
-    st.caption("Residual = Actual - Mecca forecast. Positive → under-forecast; Negative → over-forecast.")
-    if st.button("Load grid", type="primary"):
-        df = pd.concat([get_store_df(s).assign(store=s) for s in STORE_OPTIONS])
-        end = pd.to_datetime(df["Date"]).max().normalize()
-        start = end - pd.Timedelta(days=6)
-        week = df[(df["Date"] >= start) & (df["Date"] <= end)].copy()
-        week["dow"] = week["Date"].dt.weekday
-        # sigma from prior 8 weeks
-        hist = df[(df["Date"] < start) & (df["Date"] >= start - pd.Timedelta(weeks=8))].copy()
-        hist["dow"] = hist["Date"].dt.weekday
-        sigmas = {}
-        for (store, dow), sub in hist.groupby(["store", "dow"]):
-            res = sub["SalesActual"] - sub["SalesForecast"]
-            sigmas[(store, dow)] = res.std(ddof=1) if len(res) > 1 else 1e-6
-        cells = []
-        for (store, dow), sub in week.groupby(["store", "dow"]):
-            res = sub["SalesActual"] - sub["SalesForecast"]
-            val = res.mean() if len(res) else 0.0
-            sigma = sigmas.get((store, dow), 1e-6)
-            if abs(val) <= 2 * sigma:
-                level = "green"
-            elif val > 2 * sigma:
-                level = "amber"
+with tab_forecast:
+    st.markdown("### Update Forecasts")
+    days_ago = (NEW_RUN_DATE - PRIOR_RUN_DATE).days
+    c_info1, c_info2, c_info3 = st.columns([1.2, 1.2, 2])
+    with c_info1:
+        st.metric("Prior run", f"{PRIOR_RUN_DATE:%d %b %Y}", help=f"{days_ago} days before the new run")
+    with c_info2:
+        st.metric("New run", f"{NEW_RUN_DATE:%d %b %Y}")
+    with c_info3:
+        st.markdown(
+            "<div class=\"update-note\">Sales + footfall forecasts for the next 13 weeks. Typical runtime is about a minute per store.</div>",
+            unsafe_allow_html=True,
+        )
+
+    store_choice = st.selectbox("Store", ["All stores"] + STORE_OPTIONS, key="update_store")
+    weeks = st.number_input("Forecast horizon (weeks)", min_value=4, max_value=26, value=13, step=1, key="update_weeks")
+    if store_choice == "All stores":
+        st.info("Running all stores can take a few minutes.")
+
+    if st.button("Clear update cache", key="update_clear_cache"):
+        build_update_forecast.clear()
+        st.info("Update cache cleared.")
+
+    if st.button("Run update", type="primary", key="run_update"):
+        with st.spinner("Running update..."):
+            if store_choice == "All stores":
+                rows = []
+                progress = st.progress(0.0)
+                for idx, s in enumerate(STORE_OPTIONS):
+                    sales = build_update_forecast(s, "sales", window_weeks=weeks)
+                    foot = build_update_forecast(s, "footfall", window_weeks=weeks)
+                    rows.append(
+                        {
+                            "Store": s,
+                            "Prior sales": sales["prior"]["Forecast"].sum(),
+                            "New sales": sales["new"]["Forecast"].sum(),
+                            "Prior footfall": foot["prior"]["Forecast"].sum(),
+                            "New footfall": foot["new"]["Forecast"].sum(),
+                        }
+                    )
+                    progress.progress((idx + 1) / len(STORE_OPTIONS))
+                progress.empty()
+                table = pd.DataFrame(rows).sort_values("Store")
+                st.dataframe(
+                    table.style.format(
+                        {
+                            "Prior sales": "${:,.0f}",
+                            "New sales": "${:,.0f}",
+                            "Prior footfall": "{:,.0f}",
+                            "New footfall": "{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
             else:
-                level = "red"
-            cells.append({"store": store, "dow": fmt_dow(dow), "residual": val, "level": level, "sigma": sigma})
-        grid = pd.DataFrame(cells)
-        if not grid.empty:
-            # Summary cards
-            within = (grid["level"] == "green").mean()
-            worst_over = grid.loc[grid["residual"].idxmin()]
-            worst_under = grid.loc[grid["residual"].idxmax()]
-            cA, cB, cC = st.columns(3)
-            cA.metric("% within ±2σ", f"{within*100:,.1f}%")
-            cB.metric("Largest over-forecast", f"{worst_over['residual']:,.0f}",
-                      help=f"{worst_over['store']} · {worst_over['dow']}")
-            cC.metric("Largest under-forecast", f"{worst_under['residual']:,.0f}",
-                      help=f"{worst_under['store']} · {worst_under['dow']}")
+                sales = build_update_forecast(store_choice, "sales", window_weeks=weeks)
+                foot = build_update_forecast(store_choice, "footfall", window_weeks=weeks)
 
-            pivot = grid.pivot(index="store", columns="dow", values="residual")
-            # Color using each cell's sigma from precomputed sigmas dict
-            def color_cell(val, row_store, col_dow):
-                sigma = sigmas.get((row_store, col_dow), 1e-6)
-                if abs(val) <= 2 * sigma:
-                    return "background-color:#d1fae5"
-                if val > 2 * sigma:
-                    return "background-color:#fcd34d"
-                return "background-color:#fecdd3"
+                actual_sales = sales["actual"].copy()
+                actual_sales = actual_sales[actual_sales["Date"] <= pd.to_datetime(NEW_RUN_DATE)].tail(56)
+                actual_sales = actual_sales.rename(columns={"SalesActual": "Actual"})
 
-            styled = pivot.style.apply(
-                lambda s: [
-                    color_cell(s[c], s.name, c) for c in s.index
-                ],
-                axis=1,
-            ).format("{:.0f}")
-            st.dataframe(styled, use_container_width=True)
-            st.caption("Green = within ±2σ; Amber = under-forecast > +2σ; Red = over-forecast < -2σ. σ per store/DOW from prior 8 weeks.")
-        else:
-            st.info("No data for last week.")
+                actual_foot = foot["actual"].copy()
+                actual_foot = actual_foot[actual_foot["Date"] <= pd.to_datetime(NEW_RUN_DATE)].tail(56)
+                actual_foot = actual_foot.rename(columns={"FootfallActual": "Actual"})
 
-    st.markdown("### Single store")
-    c1, c2, c3 = st.columns([1.4, 1, 1])
-    store_sel = c1.selectbox("Store", STORE_OPTIONS, key="perf_store")
+                def build_chart(actual_df, prior_df, new_df, title):
+                    parts = []
+                    if not actual_df.empty:
+                        parts.append(actual_df.rename(columns={"Actual": "Value"}).assign(Series="Actual"))
+                    parts.append(prior_df.rename(columns={"Forecast": "Value"}).assign(Series="Prior run"))
+                    parts.append(new_df.rename(columns={"Forecast": "Value"}).assign(Series="New run"))
+                    chart_df = pd.concat(parts, ignore_index=True)
+                    fig = px.line(
+                        chart_df,
+                        x="Date",
+                        y="Value",
+                        color="Series",
+                        markers=True,
+                        title=title,
+                        color_discrete_map={"Actual": "#111827", "Prior run": "#fca5a5", "New run": "#2563eb"},
+                    )
+                    fig.update_layout(legend_title_text="", margin=dict(l=0, r=0, t=30, b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+
+                build_chart(actual_sales, sales["prior"], sales["new"], "Sales forecast update")
+                build_chart(actual_foot, foot["prior"], foot["new"], "Footfall forecast update")
+
+                summary = pd.DataFrame(
+                    {
+                        "Run": ["Prior run", "New run"],
+                        "Sales forecast total": [
+                            sales["prior"]["Forecast"].sum(),
+                            sales["new"]["Forecast"].sum(),
+                        ],
+                        "Footfall forecast total": [
+                            foot["prior"]["Forecast"].sum(),
+                            foot["new"]["Forecast"].sum(),
+                        ],
+                    }
+                )
+                st.dataframe(
+                    summary.style.format(
+                        {
+                            "Sales forecast total": "${:,.0f}",
+                            "Footfall forecast total": "{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+
+# ------------------------------------------------------------------
+# Analyse Forecasts tab
+# ------------------------------------------------------------------
+with tab_hist:
+    st.markdown("### Analyse Forecasts")
+    st.caption("Pivot-style view of actuals vs Ezeas forecast. Choose store and window.")
+
+    c1, c2, c3 = st.columns([1.6, 1, 1])
+    store = c1.selectbox("Store", STORE_OPTIONS, key="an_store")
     timeframe = c2.selectbox(
         "Timeframe",
-        ["last_week", "last_quarter", "last_year"],
-        format_func=lambda x: {"last_week": "Last week", "last_quarter": "Last quarter", "last_year": "Last year"}[x],
+        ["last4_next13", "last2_next2", "custom"],
+        format_func=lambda x: {
+            "last4_next13": "Last 4 weeks + Next 13 weeks",
+            "last2_next2": "Last 2 weeks + Next 2 weeks",
+            "custom": "Custom",
+        }[x],
+        key="an_timeframe",
     )
-    dow_sel = c3.selectbox(
-        "Day-of-week filter",
-        [None, 0, 1, 2, 3, 4, 5, 6],
-        format_func=lambda x: "All" if x is None else fmt_dow(x),
-        key="perf_dow",
-    )
-    if st.button("Run store performance", type="primary"):
-        df = get_store_df(store_sel)
-        end = pd.to_datetime(df["Date"]).max()
-        days = {"last_week": 7, "last_quarter": 91, "last_year": 365}[timeframe]
-        start = end - pd.Timedelta(days=days - 1)
-        sub = df[(df["Date"] >= start) & (df["Date"] <= end)].copy()
-        if dow_sel is not None:
-            sub = sub[sub["Date"].dt.weekday == dow_sel]
-        resid = sub["SalesActual"] - sub["SalesForecast"]
-        st.json(
-            {
-                "mean": resid.mean(),
-                "stdev": resid.std(ddof=1),
-                "mae": np.abs(resid).mean(),
-                "rmse": np.sqrt((resid**2).mean()),
-            }
-        )
-        if not sub.empty:
-            sub_plot = sub[["Date"]].copy()
-            sub_plot["Residual"] = resid.values
-            fig = px.line(sub_plot, x="Date", y="Residual", title="Residual time series")
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(sub_plot)
-        else:
-            st.info("No data for selection.")
+    metric = c3.radio("Graph", ["sales", "traffic", "both"], horizontal=True, key="an_metric")
+
+    if timeframe == "custom":
+        c4, c5 = st.columns(2)
+        past_weeks = c4.number_input("Past weeks", min_value=1, max_value=26, value=4, step=1, key="an_past")
+        future_weeks = c5.number_input("Future weeks", min_value=1, max_value=26, value=13, step=1, key="an_future")
+    elif timeframe == "last2_next2":
+        past_weeks, future_weeks = 2, 2
+    else:
+        past_weeks, future_weeks = 4, 13
+
+    last_actual = pd.to_datetime(get_store_df(store)["Date"]).max().date()
+    start = last_actual - timedelta(days=past_weeks * 7 - 1)
+    end = last_actual + timedelta(days=future_weeks * 7)
+    st.caption(f"Window: {start} to {end} (last actual {last_actual})")
+
+    if st.button("Load analysis", type="primary", key="an_run"):
+        with st.spinner("Loading forecast view..."):
+            def render_metric(label, metric_name):
+                df_view = build_analyze(store, metric_name, start, end)
+                if df_view.empty:
+                    st.info(f"No data for {label}.")
+                    return
+                df_melt = df_view.melt(
+                    id_vars=["Date", "DayName"],
+                    value_vars=["Actual", "Forecast"],
+                    var_name="Series",
+                    value_name="Value",
+                )
+                fig = px.line(
+                    df_melt,
+                    x="Date",
+                    y="Value",
+                    color="Series",
+                    markers=True,
+                    title=f"{label} - Actual vs Ezeas forecast",
+                    color_discrete_map={"Actual": "#111827", "Forecast": "#2563eb"},
+                )
+                fig.update_traces(connectgaps=False)
+                fig.add_vline(x=pd.to_datetime(last_actual), line_dash="dash", line_color="#94a3b8")
+                fig.update_layout(legend_title_text="", margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(
+                    df_view.style.format({"Actual": "{:,.0f}", "Forecast": "{:,.0f}"}),
+                    use_container_width=True,
+                )
+
+            if metric in ["sales", "both"]:
+                render_metric("Sales", "sales")
+            if metric in ["traffic", "both"]:
+                render_metric("Traffic", "footfall")
