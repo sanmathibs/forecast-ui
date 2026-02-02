@@ -31,6 +31,7 @@ APP_TITLE = "Forecast & Performance Console"
 STORE_OPTIONS = list_stores()
 DEFAULT_STORE = STORE_OPTIONS[0] if STORE_OPTIONS else ""
 SNAPSHOT_CACHE_DIR = ROOT / "ui" / ".cache"
+SNAPSHOT_STATIC_DIR = ROOT / "ui" / "static_snapshots"
 SNAPSHOT_CACHE_VERSION = 7
 CALIBRATION_WEEKS = 13
 PRIOR_RUN_DATE = datetime(2025, 10, 11).date()
@@ -229,17 +230,17 @@ def build_update_forecast(store, metric, window_weeks=UPDATE_HORIZON_WEEKS):
     return payload
 
 
-def _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks):
+def _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks, base_dir=SNAPSHOT_CACHE_DIR):
     key = (
         f"snapshot_v{SNAPSHOT_CACHE_VERSION}_"
         f"{'ezeas' if include_ezeas else 'mecca'}_"
         f"{quantum_hours}_{blend_weight}_{window_weeks}w.pkl"
     )
-    return SNAPSHOT_CACHE_DIR / key
+    return base_dir / key
 
 
-def _load_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime):
-    path = _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks)
+def _load_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime, ignore_mtime=False, base_dir=SNAPSHOT_CACHE_DIR):
+    path = _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks, base_dir=base_dir)
     if not path.exists():
         return None
     try:
@@ -247,7 +248,7 @@ def _load_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_week
             payload = pickle.load(f)
         meta = payload.get("meta", {})
         if (
-            meta.get("data_mtime") == data_mtime
+            (ignore_mtime or meta.get("data_mtime") == data_mtime)
             and meta.get("cache_version") == SNAPSHOT_CACHE_VERSION
             and meta.get("include_ezeas") == include_ezeas
             and meta.get("quantum_hours") == quantum_hours
@@ -260,8 +261,8 @@ def _load_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_week
     return None
 
 
-def _save_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime, data):
-    SNAPSHOT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def _save_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_weeks, data_mtime, data, base_dir=SNAPSHOT_CACHE_DIR):
+    base_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "meta": {
             "data_mtime": data_mtime,
@@ -274,7 +275,7 @@ def _save_snapshot_cache(include_ezeas, quantum_hours, blend_weight, window_week
         },
         "data": data,
     }
-    path = _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks)
+    path = _snapshot_cache_path(include_ezeas, quantum_hours, blend_weight, window_weeks, base_dir=base_dir)
     with path.open("wb") as f:
         pickle.dump(payload, f)
 
@@ -529,7 +530,20 @@ with tab_snapshot:
     include_ezeas = True
     data_mtime = Path(DATA_FILE).stat().st_mtime
 
-    def get_snapshot(window_weeks, rebuild=False):
+    def get_snapshot(window_weeks, rebuild=False, static=False):
+        if static:
+            cached = _load_snapshot_cache(
+                include_ezeas,
+                6.0,
+                0.3,
+                window_weeks,
+                data_mtime,
+                ignore_mtime=True,
+                base_dir=SNAPSHOT_STATIC_DIR,
+            )
+            if cached:
+                return cached.get("data"), cached.get("meta")
+            return (pd.DataFrame(), {}, None), {}
         if not rebuild:
             cached = _load_snapshot_cache(include_ezeas, 6.0, 0.3, window_weeks, data_mtime)
             if cached:
@@ -541,22 +555,8 @@ with tab_snapshot:
             return cached.get("data"), cached.get("meta")
         return (pd.DataFrame(), {}, None), {}
 
-    c_snap1, c_snap2, c_snap3 = st.columns([1, 1, 2])
-    with c_snap1:
-        if st.button("Rebuild 1-week", type="primary", key="snap_build_1w"):
-            snap1_data, snap1_meta = get_snapshot(1, rebuild=True)
-        else:
-            snap1_data, snap1_meta = get_snapshot(1)
-    with c_snap2:
-        if st.button("Rebuild 4-week", key="snap_build_4w"):
-            snap4_data, snap4_meta = get_snapshot(4, rebuild=True)
-        else:
-            snap4_data, snap4_meta = get_snapshot(4)
-    with c_snap3:
-        if st.button("Clear snapshot cache", key="snap_clear"):
-            weekly_snapshot.clear()
-            snap1_data, snap1_meta = (pd.DataFrame(), {}, None), {}
-            snap4_data, snap4_meta = (pd.DataFrame(), {}, None), {}
+    snap1_data, snap1_meta = get_snapshot(1, static=True)
+    snap4_data, snap4_meta = get_snapshot(4, static=True)
 
     def render_snapshot(title, payload, meta):
         snap_df, snap_details, snap_window = payload
@@ -567,7 +567,7 @@ with tab_snapshot:
             st.caption(f"Cached snapshot built at {meta['built_at']}")
 
         if snap_df.empty:
-            st.info("No data available for snapshot.")
+            st.info("No static snapshot found. Add the prebuilt cache files in ui/.cache to render instantly.")
             return snap_df, snap_details, snap_window
 
         snap_display = snap_df.copy()
